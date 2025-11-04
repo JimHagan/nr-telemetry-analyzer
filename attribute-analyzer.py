@@ -895,7 +895,7 @@ def generate_insights_summary(df, total_logs, sorted_stats):
     to be used as context for the Gemini API call.
     """
     print("\n" + ("=" * 20))
-    print("  Generating statistical summary for Gemini...")
+    print("  Generating statistical summary as input...")
     
     summary = []
     summary.append(f"Log Sample Analysis (Total Logs: {total_logs})\n")
@@ -953,8 +953,8 @@ def call_gemini_for_insights(summary_text, api_key):
     print("  (This may take a few seconds)...")
     
     # We must use the 'gemini-2.5-flash-preview-09-2025' model
-    model = "gemini-2.5-flash-preview-09-2025"
-    
+    # model = "gemini-2.5-flash-preview-09-2025"
+    model = "gemini-2.5-pro"
     # The URL for the generateContent endpoint (using Python f-string)
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     
