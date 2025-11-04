@@ -44,6 +44,7 @@ import argparse
 import pandas as pd
 from collections import Counter
 import os  # For file extension checking
+import textwrap
 import time # For status messages
 import numpy as np # For checking nan
 import requests # For making API calls
@@ -317,7 +318,7 @@ def print_best_attributes(total_logs, sorted_stats, presence_threshold_pct):
             
         # Format examples for clean printing
         example_str = ", ".join([f'"{str(e)}"' for e in item['examples']])
-        print(f"    * **Examples:** {example_str}")
+        print(f"    * **Examples:** {textwrap.shorten(example_str, width=300, placeholder=' (truncated)...')}")
 
     if not found_attributes:
         print(f"\nNo attributes met the {presence_threshold_pct}% presence threshold.")
@@ -370,7 +371,7 @@ def infer_anomaly_type(message, level):
         return (
             "Potential Log Storm (Repetitive Error)",
             "This indicates a component is likely stuck in a retry loop (e.g., cannot "
-            "connect to a destination) OR simply a repitive logger. Fixing the root cause will stop this log storm."
+            "connect to a destination) OR simply a repetitive logger. Fixing the root cause will stop this log storm."
         )
 
     # --- Type 2: Repetitive "OK" / Polling ---
