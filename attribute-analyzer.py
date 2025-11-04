@@ -51,7 +51,7 @@ import requests # For making API calls
 # --- Analysis Configuration ---
 # (All previous constants remain here)
 # ...
-CARDINALITY_UPPER_LIMIT = 100
+CARDINALITY_UPPER_LIMIT = 10000
 BEST_COMBO_COUNT = 6
 TOP_ANOMALOUS_MESSAGES = 5
 MIN_FREQ_ANOMALY_THRESHOLD_PCT = 0.5
@@ -370,7 +370,7 @@ def infer_anomaly_type(message, level):
         return (
             "Potential Log Storm (Repetitive Error)",
             "This indicates a component is likely stuck in a retry loop (e.g., cannot "
-            "connect to a destination). Fixing the root cause will stop this log storm."
+            "connect to a destination) OR simply a repitive logger. Fixing the root cause will stop this log storm."
         )
 
     # --- Type 2: Repetitive "OK" / Polling ---
@@ -948,7 +948,7 @@ def call_gemini_for_insights(summary_text, api_key):
     a natural language analysis. (Now synchronous using 'requests')
     """
     print("\n" + ("=" * 20))
-    print("  Calling Gemini API for advanced analysis...")
+    print("  Running advanced analysis...")
     print("  (This may take a few seconds)...")
     
     # We must use the 'gemini-2.5-flash-preview-09-2025' model
@@ -1139,7 +1139,7 @@ def main():
             gemini_response = call_gemini_for_insights(summary_text, args.GEMINI_API_KEY)
             
             # 3. Print the response
-            print_header("Gemini Advanced Analysis")
+            print_header("Advanced Analysis")
             print(gemini_response)
 
 
