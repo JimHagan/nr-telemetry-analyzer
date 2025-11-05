@@ -46,6 +46,7 @@ import textwrap
 import time # For status messages
 import numpy as np # For checking nan
 import requests # For making API calls
+import re # For log template generation
 
 # --- Analysis Configuration ---
 # (All previous constants remain here)
@@ -83,10 +84,30 @@ HASH_COLUMNS_TO_EXCLUDE = ATTRIBUTES_TO_IGNORE + [
     'request.id', 'request_id', 'messageId'
 ]
 
+# --- NEW: Regex for Log Template Generation ---
+# List of regexes to replace with a wildcard '*'.
+# Order matters: more specific (like UUIDs) should come before more general (like numbers).
+LOG_TEMPLATE_REGEXES = [
+    # UUIDs
+    re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'),
+    # Email addresses
+    re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'),
+    # IPv4 Addresses
+    re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'),
+    # Long hex strings (e.g., commit hashes, trace IDs)
+    re.compile(r'\b[0-9a-fA-F]{12,}\b'),
+    # Strings in single quotes
+    re.compile(r"(?<=')[^']+(?=')"),
+    # Strings in double quotes
+    re.compile(r'(?<=")[^"]+(?=")'),
+    # Numbers (integers and floats)
+    re.compile(r'\b\d+[\.,\d]*\b'),
+    # Simple GUIDs (e.g. 32-char hex)
+    re.compile(r'\b[0-9a-fA-F]{32}\b'),
+]
+
 
 # --- Helper & Printing Functions ---
-# (All previous helper functions: print_header, _dedup_names, load_log_file, etc.)
-# ...
 def print_header(title):
     """Prints a formatted section header."""
     print("\n" + ("-" * 60))
@@ -131,18 +152,26 @@ def _get_metric_group(metric_name):
     except Exception:
         return 'unknown_group'
 
-# --- CORRECTED HELPER ---
 def find_first_column(df_columns, potential_names):
     """
     Finds the first column name in the DataFrame that exists from a list.
     This is case-insensitive as it assumes df_columns is already lowercased.
     """
     for name in potential_names:
-        # --- FIX: check the lowercased version of the name ---
         if name.lower() in df_columns:
             return name.lower()
     return None
-# --- END CORRECTED HELPER ---
+
+# --- NEW HELPER FUNCTION ---
+def _generate_log_template(message):
+    """
+    Applies regexes to a message string to replace variables with wildcards.
+    """
+    template = str(message)
+    for regex in LOG_TEMPLATE_REGEXES:
+        template = regex.sub('*', template)
+    return template
+# --- END NEW HELPER ---
 
 def load_log_file(filepath):
     """
@@ -1169,8 +1198,84 @@ def print_metricname_deep_dive(df_with_metrics, total_logs):
     return "\n".join(gemini_summary)
 # --- END MODIFIED FUNCTION ---
 
+# --- NEW: Log Template Analysis Function ---
+def print_message_template_analysis(df, total_logs, total_sample_size):
+    """
+    Analyzes log messages by first converting them to templates to find
+    high-frequency patterns.
+    """
+    print_header("Message Template Analysis (Log Patterning)")
+    
+    message_col = find_first_column(df.columns, ['message'])
+    if not message_col:
+        print("  ...Skipping template analysis: 'message' column not found.")
+        return None
+        
+    print("  ...Generating log templates for all unique messages (this may take a moment)...")
+    start_time = time.time()
+    
+    # 1. Get all unique messages
+    unique_messages = df[message_col].astype(str).unique()
+    
+    # 2. Create a mapping from raw message to its template
+    # This is much faster than running regex on every row
+    template_map = {msg: _generate_log_template(msg) for msg in unique_messages}
+    
+    # 3. Map the templates back to the DataFrame
+    df['log_template'] = df[message_col].astype(str).map(template_map)
+    
+    end_time = time.time()
+    print(f"  ...Templating complete for {len(unique_messages)} unique messages ({end_time - start_time:.2f}s).")
+    
+    # 4. Group by the new 'log_template' and get aggregates
+    print("  ...Aggregating stats by template...")
+    agg_stats = df.groupby('log_template').agg(
+        total_count=('log_total_size', 'size'),
+        total_size=('log_total_size', 'sum'),
+        unique_message_count=(message_col, 'nunique')
+    )
+    
+    if total_sample_size == 0: total_sample_size = 1 # Avoid division by zero
 
-def generate_insights_summary(df, total_logs, sorted_stats, metric_summary=None):
+    # === SECTION 1: BY INGEST SIZE (COST) ===
+    print("\n" + ("=" * 20))
+    print("  ### Top 10 Templates by Ingest Size (Cost) ###")
+    print("=" * 20)
+
+    gemini_summary = []
+    
+    for template, row in agg_stats.sort_values(by='total_size', ascending=False).head(10).iterrows():
+        count_pct = (row['total_count'] / total_logs) * 100
+        size_pct = (row['total_size'] / total_sample_size) * 100
+        
+        print(f"\n**Template (Size Rank):** `{template}`")
+        print(f"    * **Payload Size:** {size_pct:.2f}% of total sample ({row['total_size']} chars)")
+        print(f"    * **Log Count:** {count_pct:.2f}% of total sample ({row['total_count']} logs)")
+        print(f"    * **Variations:** {row['unique_message_count']} unique messages match this pattern.")
+
+        if len(gemini_summary) < 3:
+             gemini_summary.append(f"- (Size: {size_pct:.1f}%) `{template}`")
+    
+    # === SECTION 2: BY LOG COUNT (FREQUENCY) ===
+    print("\n" + ("=" * 20))
+    print("  ### Top 10 Templates by Log Count (Frequency) ###")
+    print("=" * 20)
+
+    for template, row in agg_stats.sort_values(by='total_count', ascending=False).head(10).iterrows():
+        count_pct = (row['total_count'] / total_logs) * 100
+        size_pct = (row['total_size'] / total_sample_size) * 100
+        
+        print(f"\n**Template (Count Rank):** `{template}`")
+        print(f"    * **Log Count:** {count_pct:.2f}% of total sample ({row['total_count']} logs)")
+        print(f"    * **Payload Size:** {size_pct:.2f}% of total sample ({row['total_size']} chars)")
+        print(f"    * **Variations:** {row['unique_message_count']} unique messages match this pattern.")
+        
+    print(f"\n  ...Message template analysis complete.")
+    return "\n".join(gemini_summary)
+# --- END NEW FUNCTION ---
+
+
+def generate_insights_summary(df, total_logs, sorted_stats, metric_summary=None, template_summary=None):
     """
     Generates a concise text summary of the statistical analysis
     to be used as context for the Gemini API call.
@@ -1222,11 +1327,15 @@ def generate_insights_summary(df, total_logs, sorted_stats, metric_summary=None)
             if len(examples) > 0:
                  summary.append(f"- Examples for '{col}': {', '.join([str(e) for e in examples])}")
 
-    # --- NEW: Add Metric Summary if it exists ---
+    # --- Add Metric Summary if it exists ---
     if metric_summary:
         summary.append("\n--- MetricName Deep Dive Summary ---")
         summary.append(metric_summary)
-    # --- END NEW ---
+        
+    # --- Add Template Summary if it exists ---
+    if template_summary:
+        summary.append("\n--- Top 3 Log Templates by Size ---")
+        summary.append(template_summary)
 
     return "\n".join(summary)
 
@@ -1379,7 +1488,7 @@ def main():
 
     args = parser.parse_args()
     
-    print("\n--- Step 1/5: Loading Log File ---")
+    print("\n--- Step 1/6: Loading Log File ---")
     start_load = time.time()
     df = load_log_file(args.filepath)
     if df is None or df.empty:
@@ -1389,10 +1498,10 @@ def main():
     print(f"--- File loaded in {end_load - start_load:.2f}s ---")
     
 
-    print("\n--- Step 2/5: Analyzing Attributes ---")
+    print("\n--- Step 2/6: Analyzing Attributes ---")
     total_logs, sorted_stats = analyze_attributes(df)
     
-    print("\n--- Step 3/5: Generating Summary Reports ---")
+    print("\n--- Step 3/6: Generating Summary Reports ---")
     start_report = time.time() 
     best_attributes = print_best_attributes(total_logs, sorted_stats, args.PRESENCE_THRESHOLD_PCT)
     print_combination_analysis(best_attributes)
@@ -1402,23 +1511,23 @@ def main():
     # --- END CORRECTION ---
     
     # --- NEW: Step 4: Calculate Hashes and Sizes ---
-    # This is moved here so 'log_total_size' is available for all anomaly steps
-    print("\n--- Step 4/5: Calculating Hashes and Payload Sizes ---")
+    print("\n--- Step 4/6: Calculating Hashes and Payload Sizes ---")
     size_threshold, df_with_metrics = calculate_log_hashes_and_size(df, args.PAYLOAD_SIZE_PERCENTILE)
-    # We use df_with_metrics (which contains log_hash, log_total_size) for all subsequent analysis
-    # If hashing failed (e.g., no 'message'), df_with_metrics might be None or just lack 'log_hash'
+    
     if df_with_metrics is None:
         print("...Hashing/size calculation failed, falling back to original DataFrame for remaining analysis.")
         df_with_metrics = df.copy() # Use a copy to avoid side-effects
         if 'log_total_size' not in df_with_metrics.columns:
              print("...Manually calculating log_total_size as fallback.")
              df_with_metrics['log_total_size'] = df.astype(str).apply(lambda x: x.str.len()).sum(axis=1)
-
-
-    # --- MODIFIED: Step 5: Anomaly & Metric Analysis ---
-    print("\n--- Step 5/5: Analyzing Anomalies & Metrics ---")
     
-    # --- THIS IS THE CORRECTED LINE ---
+    # Calculate total sample size *after* size calculation is done
+    total_sample_size = df_with_metrics['log_total_size'].sum()
+
+
+    # --- Step 5: Anomaly & Metric Analysis ---
+    print("\n--- Step 5/6: Analyzing Anomalies & Metrics ---")
+    
     # Run the standard anomaly insights
     print_all_anomaly_insights(df_with_metrics, size_threshold, total_logs, TOP_ANOMALOUS_MESSAGES,
                                args.LOG_HASH_FREQUENCY_THRESHOLD,
@@ -1426,14 +1535,16 @@ def main():
                                args.LARGE_ATTR_CHAR_LENGTH,
                                args.LARGE_ATTR_PERCENTILE,
                                args.LARGE_ATTR_PRESENCE_THRESHOLD)
-    # --- END CORRECTION ---
 
-    # --- NEW: Run the MetricName Deep Dive ---
-    # This function will print its own header
+    # Run the MetricName Deep Dive
     metric_summary = print_metricname_deep_dive(df_with_metrics, total_logs)
     
+    # --- NEW: Step 6: Log Template Analysis ---
+    print("\n--- Step 6/7: Analyzing Message Templates ---")
+    template_summary = print_message_template_analysis(df_with_metrics, total_logs, total_sample_size)
+    
 
-    # --- NEW: Step 6 (Conditional) ---
+    # --- NEW: Step 7 (Conditional) ---
     if args.analyze_with_gemini:
         # --- Check for API Key ---
         if not args.GEMINI_API_KEY:
@@ -1444,9 +1555,10 @@ def main():
             print("You can generate a key at https://aistudio.google.com/app/apikey")
             print(("!" * 60) + "\n")
         else:
-            print("\n--- Step 6/6: Generating Advanced Analysis with Gemini ---")
-            # 1. Generate the summary, now including the metric_summary
-            summary_text = generate_insights_summary(df, total_logs, sorted_stats, metric_summary)
+            print("\n--- Step 7/7: Generating Advanced Analysis with Gemini ---")
+            # 1. Generate the summary, now including metric and template summaries
+            summary_text = generate_insights_summary(df, total_logs, sorted_stats, 
+                                                     metric_summary, template_summary)
             
             # 2. Call the API
             gemini_response = call_gemini_for_insights(summary_text, args.GEMINI_API_KEY)
