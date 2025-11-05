@@ -5,8 +5,6 @@ Description:
 This script loads a JSON or CSV log sample file, analyzes its contents,
 and provides insights into log attributes and potential high-volume anomalies.
 
-... (script description) ...
-
 NEW CAPABILITY:
 --analyze_with_gemini
 This flag will run all local analyses and then send a summary of the
@@ -108,6 +106,39 @@ def _dedup_names(names):
         else:
             counts[name] = 1
     return names
+
+def _get_metric_group(metric_name):
+    """
+    Applies logic to group a metric name by its prefix.
+    e.g., 'aws.lambda.invocations' -> 'aws.lambda'
+    e.g., 'http.server.requests' -> 'http.server'
+    e.g., 'newrelic.apm.jvm.memory.heap.used' -> 'newrelic.apm'
+    """
+    try:
+        parts = str(metric_name).split('.')
+        if len(parts) <= 2:
+            return str(metric_name) # Already a group or simple name
+        
+        # Define common high-level prefixes that benefit from 2-part grouping
+        common_prefixes = ['aws', 'gcp', 'azure', 'newrelic', 'apm', 'http', 'db', 'database']
+        
+        if parts[0].lower() in common_prefixes and len(parts) > 2:
+            # Return first two parts (e.g., 'aws.lambda', 'http.server')
+            return f"{parts[0]}.{parts[1]}"
+        else:
+            # For unknown or simple prefixes, just return the first part
+            return parts[0]
+    except Exception:
+        return 'unknown_group'
+
+# --- NEW HELPER ---
+def find_first_column(df_columns, potential_names):
+    """Finds the first column name in the DataFrame that exists from a list."""
+    for name in potential_names:
+        if name in df_columns:
+            return name
+    return None
+# --- END NEW HELPER ---
 
 def load_log_file(filepath):
     """
@@ -413,18 +444,20 @@ def calculate_log_hashes_and_size(df, payload_size_percentile):
     exclude_cols = set(HASH_COLUMNS_TO_EXCLUDE)
     cols_to_hash = [col for col in df.columns if col not in exclude_cols]
     
+    hash_failed = False
+    
     if 'message' not in cols_to_hash:
         print("  ...Skipping hash analysis: 'message' column not found.")
-        return None, None
-        
-    print(f"  ...Hashing based on {len(cols_to_hash)} attributes.")
-    try:
-        # Convert all columns to string before hashing to avoid errors
-        hashes = pd.util.hash_pandas_object(df[cols_to_hash].astype(str), index=False)
-        df['log_hash'] = hashes
-    except Exception as e:
-        print(f"  ...An error occurred during log hashing: {e}")
-        return None, None
+        hash_failed = True
+    else:
+        print(f"  ...Hashing based on {len(cols_to_hash)} attributes.")
+        try:
+            # Convert all columns to string before hashing to avoid errors
+            hashes = pd.util.hash_pandas_object(df[cols_to_hash].astype(str), index=False)
+            df['log_hash'] = hashes
+        except Exception as e:
+            print(f"  ...An error occurred during log hashing: {e}")
+            hash_failed = True
 
     # Calculate total size of all string-converted columns
     print("  ...Calculating total payload size for each log.")
@@ -438,7 +471,11 @@ def calculate_log_hashes_and_size(df, payload_size_percentile):
         return None, None
 
     end_time = time.time()
-    print(f"  ...Hash and size calculation complete ({end_time - start_time:.2f}s).")
+    if hash_failed:
+        print(f"  ...Size calculation complete ({end_time - start_time:.2f}s).")
+    else:
+        print(f"  ...Hash and size calculation complete ({end_time - start_time:.2f}s).")
+    
     print(f"  ...Top {100*(1-payload_size_percentile):.1f}% payload size threshold: {size_threshold:.0f} chars.")
     
     return size_threshold, df
@@ -845,51 +882,184 @@ def print_truncated_log_anomalies(df, total_logs):
     end_time = time.time()
     print(f"  ...Truncated log analysis complete ({end_time - start_time:.2f}s).")
 
-def print_all_anomaly_insights(df, total_logs, top_n, 
+def print_all_anomaly_insights(df_with_hashes, size_threshold, total_logs, top_n, 
                                log_hash_frequency_threshold,
-                               payload_size_percentile, # New
-                               payload_size_hash_frequency, # New
+                               payload_size_hash_frequency,
                                large_attr_char_length, 
                                large_attr_percentile, 
                                large_attr_presence_threshold):
     """
     Master function to run all types of anomaly analysis.
+    Assumes df_with_hashes already contains 'log_hash' and 'log_total_size'.
     """
     print_header("Potential Anomaly Insights")
     
-    # --- MODIFICATION: New analysis pipeline ---
-
-    # 1. Calculate Hashes and Sizes (this adds 'log_hash' and 'log_total_size' to df)
-    size_threshold, df_with_hashes = calculate_log_hashes_and_size(df, payload_size_percentile)
+    # --- MODIFICATION: Hashing/Sizing is now done in main() ---
     
-    if size_threshold is None: # This happens if 'message' is missing
-        print("...Skipping all hash-based anomaly detection.")
+    if size_threshold is None or df_with_hashes is None or 'log_hash' not in df_with_hashes.columns:
+        print("...Skipping all hash-based anomaly detection (required columns not found).")
     else:
         # 2. Duplicate Log Hash Analysis (Uses 'log_hash')
-        print_duplicate_log_hash_anomalies(df_with_hashes, total_logs, log_hash_frequency_threshold)
+        # We pass a copy so the drops inside don't affect other analyses
+        print_duplicate_log_hash_anomalies(df_with_hashes.copy(), total_logs, log_hash_frequency_threshold)
     
         # 3. Large Payload Hash Analysis (Uses 'log_hash' and 'log_total_size')
-        print_large_payload_hash_anomalies(df_with_hashes, total_logs, size_threshold, payload_size_hash_frequency)
+        print_large_payload_hash_anomalies(df_with_hashes.copy(), total_logs, size_threshold, payload_size_hash_frequency)
     
-        # Clean up columns
-        if 'log_hash' in df.columns:
-            df.drop(columns=['log_hash'], inplace=True, errors='ignore')
-        if 'log_total_size' in df.columns:
-            df.drop(columns=['log_total_size'], inplace=True, errors='ignore')
-
     # 4. High-Frequency Message Combinations (Message-based)
-    print_high_frequency_anomalies(df, total_logs, top_n)
+    # This function doesn't need the hash columns
+    print_high_frequency_anomalies(df_with_hashes, total_logs, top_n)
     
     # 5. Large Attribute Analysis
-    print_large_attribute_anomalies(df, total_logs, large_attr_char_length, large_attr_percentile, large_attr_presence_threshold)
+    print_large_attribute_anomalies(df_with_hashes, total_logs, large_attr_char_length, large_attr_percentile, large_attr_presence_threshold)
     
     # 6. Truncated Log Analysis
-    print_truncated_log_anomalies(df, total_logs)
+    print_truncated_log_anomalies(df_with_hashes, total_logs)
     # --- END MODIFICATION ---
 
-# --- NEW: Gemini API Call Functions (Now Synchronous) ---
+# --- MODIFIED FUNCTION ---
+def print_metricname_deep_dive(df_with_metrics, total_logs):
+    """
+    Performs a deep-dive analysis on 'metricName' if it exists,
+    breaking down ingest by metric, group, and newrelic.source.
+    """
+    print_header("MetricName Deep Dive Analysis")
+    
+    df_columns = df_with_metrics.columns
+    
+    # --- FIX 1: Find ALL possible metric and source columns ---
+    flat_metric_col = find_first_column(df_columns, ['metricname'])
+    nested_metric_col = find_first_column(df_columns, ['attributes.metricname'])
+    
+    flat_source_col = find_first_column(df_columns, ['newrelic.source'])
+    nested_source_col = find_first_column(df_columns, ['attributes.newrelic.source'])
+    logtype_col = find_first_column(df_columns, ['logtype'])
 
-def generate_insights_summary(df, total_logs, sorted_stats):
+    # If no metric columns exist at all, skip.
+    if not flat_metric_col and not nested_metric_col:
+        print("  ...No 'metricname' or 'attributes.metricname' column found. Skipping this analysis.")
+        return None
+
+    # --- FIX 2: Create a new DataFrame and COALESCE the columns ---
+    # This is the robust way to handle mixed flat/nested data.
+    
+    metric_df = df_with_metrics[['log_total_size']].copy()
+    final_metric_col = 'final_metric_name'
+    final_source_col = 'final_source'
+
+    # --- Coalesce metric columns ---
+    # 1. Start with flat metrics, or an all-NaN column if not present
+    if flat_metric_col:
+        metric_df[final_metric_col] = df_with_metrics[flat_metric_col]
+    else:
+        metric_df[final_metric_col] = np.nan
+        
+    # 2. Fill in missing values with nested metrics, if present
+    if nested_metric_col:
+        metric_df[final_metric_col] = metric_df[final_metric_col].fillna(df_with_metrics[nested_metric_col])
+
+    # --- Coalesce source columns (in priority order) ---
+    # 1. Start with flat source, or all-NaN
+    if flat_source_col:
+        metric_df[final_source_col] = df_with_metrics[flat_source_col]
+    else:
+        metric_df[final_source_col] = np.nan
+        
+    # 2. Fill with nested source
+    if nested_source_col:
+        metric_df[final_source_col] = metric_df[final_source_col].fillna(df_with_metrics[nested_source_col])
+        
+    # 3. Fill with logtype
+    if logtype_col:
+        metric_df[final_source_col] = metric_df[final_source_col].fillna(df_with_metrics[logtype_col])
+        
+    # 4. Fill any remaining with 'N/A'
+    metric_df[final_source_col] = metric_df[final_source_col].fillna('N/A')
+    
+    # --- END FIX ---
+
+    # Now, filter the new DataFrame to only rows that have a metric name
+    metric_df = metric_df[metric_df[final_metric_col].notna()]
+    
+    if metric_df.empty:
+        print(f"  ...Metric columns were found, but they contain no data. Skipping.")
+        return None
+
+    # Clean data for grouping
+    metric_df[final_metric_col] = metric_df[final_metric_col].astype(str)
+    metric_df[final_source_col] = metric_df[final_source_col].astype(str)
+    
+    if 'log_total_size' not in metric_df.columns:
+        print("  ...Error: 'log_total_size' not found. Skipping metric analysis.")
+        return None
+        
+    total_metric_ingest = metric_df['log_total_size'].sum()
+    total_sample_ingest = df_with_metrics['log_total_size'].sum()
+    
+    if total_metric_ingest == 0:
+        print("  ...Metrics found, but they contribute 0 to ingest size. Skipping.")
+        return None
+    
+    if total_sample_ingest == 0:
+        total_sample_ingest = 1 # Avoid division by zero
+
+    print(f"  ...Found {len(metric_df)} logs with metric data (from all sources).")
+    print(f"  ...These logs contribute {total_metric_ingest} chars "
+          f"({(total_metric_ingest / total_sample_ingest * 100):.1f}%) of total sample ingest.")
+
+    # String builder for Gemini summary
+    gemini_summary = [
+        f"Metric logs contribute {(total_metric_ingest / total_sample_ingest * 100):.1f}% of total ingest."
+    ]
+
+    # --- 1. Ingest Breakdown by (coalesced) source ---
+    print("\n" + ("=" * 20))
+    print(f"  Ingest Breakdown by Source (for metric logs)")
+    grouped_by_source = metric_df.groupby(final_source_col)['log_total_size'].sum().sort_values(ascending=False)
+    
+    gemini_summary.append("\nIngest by Source:")
+    for source, size in grouped_by_source.items():
+        pct = (size / total_metric_ingest) * 100
+        print(f"    * **{source}**: {pct:.1f}% ({size} chars)")
+        if pct > 5: # Only report significant sources to Gemini
+            gemini_summary.append(f"- {source}: {pct:.1f}%")
+            
+    # --- 2. Ingest Breakdown by metricName (Top 10) ---
+    print("\n" + ("=" * 20))
+    print(f"  Ingest Breakdown by metricName (Top 10)")
+    grouped_by_metric = metric_df.groupby([final_metric_col, final_source_col])['log_total_size'].sum().sort_values(ascending=False)
+    
+    gemini_summary.append("\nTop 5 Most Voluminous Metrics:")
+    for (metric, source), size in grouped_by_metric.head(10).items():
+        pct = (size / total_metric_ingest) * 100
+        print(f"    * **{metric}**")
+        print(f"        - **Source**: {source}")
+        print(f"        - **Ingest**: {pct:.1f}% ({size} chars)")
+        if len(gemini_summary) < 12: # Limit to top 5 for Gemini
+             gemini_summary.append(f"- {metric} ({source}): {pct:.1f}%")
+
+    # --- 3. Ingest Breakdown by Metric Group ---
+    print("\n" + ("=" * 20))
+    print(f"  Ingest Breakdown by Metric Group")
+    metric_df['metric_group'] = metric_df[final_metric_col].apply(_get_metric_group)
+    grouped_by_prefix = metric_df.groupby(['metric_group', final_source_col])['log_total_size'].sum().sort_values(ascending=False)
+    
+    print("  (Metrics are grouped by prefix, e.g., 'aws.lambda.*' -> 'aws.lambda')")
+    gemini_summary.append("\nIngest by Metric Group:")
+    for (group, source), size in grouped_by_prefix.head(15).items():
+        pct = (size / total_metric_ingest) * 100
+        print(f"    * **{group}**")
+        print(f"        - **Source**: {source}")
+        print(f"        - **Ingest**: {pct:.1f}% ({size} chars)")
+        if pct > 5: # Only report significant groups to Gemini
+            gemini_summary.append(f"- {group} ({source}): {pct:.1f}%")
+
+    print(f"  ...MetricName deep dive complete.")
+    return "\n".join(gemini_summary)
+# --- END MODIFIED FUNCTION ---
+
+
+def generate_insights_summary(df, total_logs, sorted_stats, metric_summary=None):
     """
     Generates a concise text summary of the statistical analysis
     to be used as context for the Gemini API call.
@@ -922,7 +1092,7 @@ def generate_insights_summary(df, total_logs, sorted_stats):
     
     summary.append("\n--- Key Attribute Examples (for infrastructure detection) ---")
     key_attrs = ['filepath', 'filePath', 'host', 'hostname', 'cluster_name',
-                 'container_name', 'platform', 'entity.name', 'logger']
+                 'container_name', 'platform', 'entity.name', 'logger', 'logtype']
     for attr in key_attrs:
         # Check for normalized AND deduplicated names
         present_cols = [c for c in df.columns if c.startswith(attr)]
@@ -940,6 +1110,12 @@ def generate_insights_summary(df, total_logs, sorted_stats):
             if len(examples) > 0:
                  summary.append(f"- Examples for '{col}': {', '.join([str(e) for e in examples])}")
 
+    # --- NEW: Add Metric Summary if it exists ---
+    if metric_summary:
+        summary.append("\n--- MetricName Deep Dive Summary ---")
+        summary.append(metric_summary)
+    # --- END NEW ---
+
     return "\n".join(summary)
 
 
@@ -953,8 +1129,8 @@ def call_gemini_for_insights(summary_text, api_key):
     print("  (This may take a few seconds)...")
     
     # We must use the 'gemini-2.5-flash-preview-09-2025' model
-    # model = "gemini-2.5-flash-preview-09-2025"
-    model = "gemini-2.5-pro"
+    model = "gemini-2.5-flash-preview-09-2025"
+    # model = "gemini-2.5-pro"
     # The URL for the generateContent endpoint (using Python f-string)
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     
@@ -1029,7 +1205,7 @@ def main():
         help='The path to the JSON or CSV log file to analyze.'
     )
     
-    # --- Tunable Arguments ---
+    # --- Tunable Arguments (All existing args remain) ---
     parser.add_argument(
         '--PRESENCE_THRESHOLD_PCT',
         type=float,
@@ -1088,7 +1264,7 @@ def main():
 
     args = parser.parse_args()
     
-    print("\n--- Step 1/4: Loading Log File ---")
+    print("\n--- Step 1/5: Loading Log File ---")
     start_load = time.time()
     df = load_log_file(args.filepath)
     if df is None or df.empty:
@@ -1098,30 +1274,49 @@ def main():
     print(f"--- File loaded in {end_load - start_load:.2f}s ---")
     
 
-    print("\n--- Step 2/4: Analyzing Attributes ---")
+    print("\n--- Step 2/5: Analyzing Attributes ---")
     total_logs, sorted_stats = analyze_attributes(df)
     
-    print("\n--- Step 3/4: Generating Summary Reports ---")
+    print("\n--- Step 3/5: Generating Summary Reports ---")
     start_report = time.time() 
-    # Pass the new argument to the function
     best_attributes = print_best_attributes(total_logs, sorted_stats, args.PRESENCE_THRESHOLD_PCT)
     print_combination_analysis(best_attributes)
     end_report = time.time()
     print(f"--- Reports generated in {end_report - start_report:.2f}s ---")
     
-    print("\n--- Step 4/4: Analyzing Message Anomalies ---")
-    # We create a copy of the dataframe for anomaly analysis, as hashing adds columns
-    df_for_anomalies = df.copy()
+    # --- NEW: Step 4: Calculate Hashes and Sizes ---
+    # This is moved here so 'log_total_size' is available for all anomaly steps
+    print("\n--- Step 4/5: Calculating Hashes and Payload Sizes ---")
+    size_threshold, df_with_metrics = calculate_log_hashes_and_size(df, args.PAYLOAD_SIZE_PERCENTILE)
+    # We use df_with_metrics (which contains log_hash, log_total_size) for all subsequent analysis
+    # If hashing failed (e.g., no 'message'), df_with_metrics might be None or just lack 'log_hash'
+    if df_with_metrics is None:
+        print("...Hashing/size calculation failed, falling back to original DataFrame for remaining analysis.")
+        df_with_metrics = df.copy() # Use a copy to avoid side-effects
+        if 'log_total_size' not in df_with_metrics.columns:
+             print("...Manually calculating log_total_size as fallback.")
+             df_with_metrics['log_total_size'] = df.astype(str).apply(lambda x: x.str.len()).sum(axis=1)
+
+
+    # --- MODIFIED: Step 5: Anomaly & Metric Analysis ---
+    print("\n--- Step 5/5: Analyzing Anomalies & Metrics ---")
     
-    print_all_anomaly_insights(df_for_anomalies, total_logs, TOP_ANOMALOUS_MESSAGES,
+    # --- THIS IS THE CORRECTED LINE ---
+    # Run the standard anomaly insights
+    print_all_anomaly_insights(df_with_metrics, size_threshold, total_logs, TOP_ANOMALOUS_MESSAGES,
                                args.LOG_HASH_FREQUENCY_THRESHOLD,
-                               args.PAYLOAD_SIZE_PERCENTILE,
                                args.PAYLOAD_SIZE_HASH_FREQUENCY,
                                args.LARGE_ATTR_CHAR_LENGTH,
                                args.LARGE_ATTR_PERCENTILE,
                                args.LARGE_ATTR_PRESENCE_THRESHOLD)
+    # --- END CORRECTION ---
 
-    # --- NEW: Step 5 (Conditional) ---
+    # --- NEW: Run the MetricName Deep Dive ---
+    # This function will print its own header
+    metric_summary = print_metricname_deep_dive(df_with_metrics, total_logs)
+    
+
+    # --- NEW: Step 6 (Conditional) ---
     if args.analyze_with_gemini:
         # --- Check for API Key ---
         if not args.GEMINI_API_KEY:
@@ -1132,9 +1327,9 @@ def main():
             print("You can generate a key at https://aistudio.google.com/app/apikey")
             print(("!" * 60) + "\n")
         else:
-            print("\n--- Step 5/5: Generating Advanced Analysis with Gemini ---")
-            # 1. Generate the summary
-            summary_text = generate_insights_summary(df, total_logs, sorted_stats)
+            print("\n--- Step 6/6: Generating Advanced Analysis with Gemini ---")
+            # 1. Generate the summary, now including the metric_summary
+            summary_text = generate_insights_summary(df, total_logs, sorted_stats, metric_summary)
             
             # 2. Call the API
             gemini_response = call_gemini_for_insights(summary_text, args.GEMINI_API_KEY)
@@ -1150,6 +1345,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Now just a standard function call
     main()
-
