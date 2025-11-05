@@ -152,15 +152,18 @@ def _get_metric_group(metric_name):
     except Exception:
         return 'unknown_group'
 
+# --- CORRECTED HELPER ---
 def find_first_column(df_columns, potential_names):
     """
     Finds the first column name in the DataFrame that exists from a list.
     This is case-insensitive as it assumes df_columns is already lowercased.
     """
     for name in potential_names:
+        # --- FIX: check the lowercased version of the name ---
         if name.lower() in df_columns:
             return name.lower()
     return None
+# --- END CORRECTED HELPER ---
 
 # --- NEW HELPER FUNCTION ---
 def _generate_log_template(message):
@@ -1204,14 +1207,15 @@ def print_message_template_analysis(df, total_logs, total_sample_size):
     Analyzes log messages by first converting them to templates to find
     high-frequency patterns.
     """
-    print_header("Message Template Analysis (Log Patterning)")
+    # --- Text Change: Template -> Pattern ---
+    print_header("Message Pattern Analysis (Log Patterning)")
     
     message_col = find_first_column(df.columns, ['message'])
     if not message_col:
-        print("  ...Skipping template analysis: 'message' column not found.")
+        print("  ...Skipping pattern analysis: 'message' column not found.")
         return None
         
-    print("  ...Generating log templates for all unique messages (this may take a moment)...")
+    print("  ...Generating log patterns for all unique messages (this may take a moment)...")
     start_time = time.time()
     
     # 1. Get all unique messages
@@ -1225,10 +1229,10 @@ def print_message_template_analysis(df, total_logs, total_sample_size):
     df['log_template'] = df[message_col].astype(str).map(template_map)
     
     end_time = time.time()
-    print(f"  ...Templating complete for {len(unique_messages)} unique messages ({end_time - start_time:.2f}s).")
+    print(f"  ...Patterning complete for {len(unique_messages)} unique messages ({end_time - start_time:.2f}s).")
     
     # 4. Group by the new 'log_template' and get aggregates
-    print("  ...Aggregating stats by template...")
+    print("  ...Aggregating stats by pattern...")
     agg_stats = df.groupby('log_template').agg(
         total_count=('log_total_size', 'size'),
         total_size=('log_total_size', 'sum'),
@@ -1239,7 +1243,7 @@ def print_message_template_analysis(df, total_logs, total_sample_size):
 
     # === SECTION 1: BY INGEST SIZE (COST) ===
     print("\n" + ("=" * 20))
-    print("  ### Top 10 Templates by Ingest Size (Cost) ###")
+    print("  ### Top 10 Patterns by Ingest Size (Cost) ###")
     print("=" * 20)
 
     gemini_summary = []
@@ -1248,7 +1252,7 @@ def print_message_template_analysis(df, total_logs, total_sample_size):
         count_pct = (row['total_count'] / total_logs) * 100
         size_pct = (row['total_size'] / total_sample_size) * 100
         
-        print(f"\n**Template (Size Rank):** `{template}`")
+        print(f"\n**Pattern (Size Rank):** `{template}`")
         print(f"    * **Payload Size:** {size_pct:.2f}% of total sample ({row['total_size']} chars)")
         print(f"    * **Log Count:** {count_pct:.2f}% of total sample ({row['total_count']} logs)")
         print(f"    * **Variations:** {row['unique_message_count']} unique messages match this pattern.")
@@ -1258,19 +1262,19 @@ def print_message_template_analysis(df, total_logs, total_sample_size):
     
     # === SECTION 2: BY LOG COUNT (FREQUENCY) ===
     print("\n" + ("=" * 20))
-    print("  ### Top 10 Templates by Log Count (Frequency) ###")
+    print("  ### Top 10 Patterns by Log Count (Frequency) ###")
     print("=" * 20)
 
     for template, row in agg_stats.sort_values(by='total_count', ascending=False).head(10).iterrows():
         count_pct = (row['total_count'] / total_logs) * 100
         size_pct = (row['total_size'] / total_sample_size) * 100
         
-        print(f"\n**Template (Count Rank):** `{template}`")
+        print(f"\n**Pattern (Count Rank):** `{template}`")
         print(f"    * **Log Count:** {count_pct:.2f}% of total sample ({row['total_count']} logs)")
         print(f"    * **Payload Size:** {size_pct:.2f}% of total sample ({row['total_size']} chars)")
         print(f"    * **Variations:** {row['unique_message_count']} unique messages match this pattern.")
         
-    print(f"\n  ...Message template analysis complete.")
+    print(f"\n  ...Message pattern analysis complete.")
     return "\n".join(gemini_summary)
 # --- END NEW FUNCTION ---
 
@@ -1334,7 +1338,8 @@ def generate_insights_summary(df, total_logs, sorted_stats, metric_summary=None,
         
     # --- Add Template Summary if it exists ---
     if template_summary:
-        summary.append("\n--- Top 3 Log Templates by Size ---")
+        # --- Text Change: Template -> Pattern ---
+        summary.append("\n--- Top 3 Log Patterns by Size ---")
         summary.append(template_summary)
 
     return "\n".join(summary)
@@ -1488,7 +1493,7 @@ def main():
 
     args = parser.parse_args()
     
-    print("\n--- Step 1/6: Loading Log File ---")
+    print("\n--- Step 1/7: Loading Log File ---")
     start_load = time.time()
     df = load_log_file(args.filepath)
     if df is None or df.empty:
@@ -1498,10 +1503,10 @@ def main():
     print(f"--- File loaded in {end_load - start_load:.2f}s ---")
     
 
-    print("\n--- Step 2/6: Analyzing Attributes ---")
+    print("\n--- Step 2/7: Analyzing Attributes ---")
     total_logs, sorted_stats = analyze_attributes(df)
     
-    print("\n--- Step 3/6: Generating Summary Reports ---")
+    print("\n--- Step 3/7: Generating Summary Reports ---")
     start_report = time.time() 
     best_attributes = print_best_attributes(total_logs, sorted_stats, args.PRESENCE_THRESHOLD_PCT)
     print_combination_analysis(best_attributes)
@@ -1510,8 +1515,8 @@ def main():
     print(f"--- Reports generated in {end_report - start_report:.2f}s ---")
     # --- END CORRECTION ---
     
-    # --- NEW: Step 4: Calculate Hashes and Sizes ---
-    print("\n--- Step 4/6: Calculating Hashes and Payload Sizes ---")
+    # --- Step 4: Calculate Hashes and Sizes ---
+    print("\n--- Step 4/7: Calculating Hashes and Payload Sizes ---")
     size_threshold, df_with_metrics = calculate_log_hashes_and_size(df, args.PAYLOAD_SIZE_PERCENTILE)
     
     if df_with_metrics is None:
@@ -1526,7 +1531,7 @@ def main():
 
 
     # --- Step 5: Anomaly & Metric Analysis ---
-    print("\n--- Step 5/6: Analyzing Anomalies & Metrics ---")
+    print("\n--- Step 5/7: Analyzing Anomalies & Metrics ---")
     
     # Run the standard anomaly insights
     print_all_anomaly_insights(df_with_metrics, size_threshold, total_logs, TOP_ANOMALOUS_MESSAGES,
@@ -1540,7 +1545,7 @@ def main():
     metric_summary = print_metricname_deep_dive(df_with_metrics, total_logs)
     
     # --- NEW: Step 6: Log Template Analysis ---
-    print("\n--- Step 6/7: Analyzing Message Templates ---")
+    print("\n--- Step 6/7: Analyzing Message Patterns ---")
     template_summary = print_message_template_analysis(df_with_metrics, total_logs, total_sample_size)
     
 
