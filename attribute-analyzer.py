@@ -5,8 +5,6 @@ Description:
 This script loads a JSON or CSV log sample file, analyzes its contents,
 and provides insights into log attributes and potential high-volume anomalies.
 
-... (script description) ...
-
 NEW CAPABILITY:
 --analyze_with_gemini
 This flag will run all local analyses and then send a summary of the
@@ -48,6 +46,7 @@ import textwrap
 import time # For status messages
 import numpy as np # For checking nan
 import requests # For making API calls
+import re # For log template generation
 
 # --- Analysis Configuration ---
 # (All previous constants remain here)
@@ -85,10 +84,30 @@ HASH_COLUMNS_TO_EXCLUDE = ATTRIBUTES_TO_IGNORE + [
     'request.id', 'request_id', 'messageId'
 ]
 
+# --- NEW: Regex for Log Template Generation ---
+# List of regexes to replace with a wildcard '*'.
+# Order matters: more specific (like UUIDs) should come before more general (like numbers).
+LOG_TEMPLATE_REGEXES = [
+    # UUIDs
+    re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'),
+    # Email addresses
+    re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'),
+    # IPv4 Addresses
+    re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'),
+    # Long hex strings (e.g., commit hashes, trace IDs)
+    re.compile(r'\b[0-9a-fA-F]{12,}\b'),
+    # Strings in single quotes
+    re.compile(r"(?<=')[^']+(?=')"),
+    # Strings in double quotes
+    re.compile(r'(?<=")[^"]+(?=")'),
+    # Numbers (integers and floats)
+    re.compile(r'\b\d+[\.,\d]*\b'),
+    # Simple GUIDs (e.g. 32-char hex)
+    re.compile(r'\b[0-9a-fA-F]{32}\b'),
+]
+
 
 # --- Helper & Printing Functions ---
-# (All previous helper functions: print_header, _dedup_names, load_log_file, etc.)
-# ...
 def print_header(title):
     """Prints a formatted section header."""
     print("\n" + ("-" * 60))
@@ -109,9 +128,59 @@ def _dedup_names(names):
             counts[name] = 1
     return names
 
+def _get_metric_group(metric_name):
+    """
+    Applies logic to group a metric name by its prefix.
+    e.g., 'aws.lambda.invocations' -> 'aws.lambda'
+    e.g., 'http.server.requests' -> 'http.server'
+    e.g., 'newrelic.apm.jvm.memory.heap.used' -> 'newrelic.apm'
+    """
+    try:
+        parts = str(metric_name).split('.')
+        if len(parts) <= 2:
+            return str(metric_name) # Already a group or simple name
+        
+        # Define common high-level prefixes that benefit from 2-part grouping
+        common_prefixes = ['aws', 'gcp', 'azure', 'newrelic', 'apm', 'http', 'db', 'database']
+        
+        if parts[0].lower() in common_prefixes and len(parts) > 2:
+            # Return first two parts (e.g., 'aws.lambda', 'http.server')
+            return f"{parts[0]}.{parts[1]}"
+        else:
+            # For unknown or simple prefixes, just return the first part
+            return parts[0]
+    except Exception:
+        return 'unknown_group'
+
+# --- CORRECTED HELPER ---
+def find_first_column(df_columns, potential_names):
+    """
+    Finds the first column name in the DataFrame that exists from a list.
+    This is case-insensitive as it assumes df_columns is already lowercased.
+    """
+    for name in potential_names:
+        # --- FIX: check the lowercased version of the name ---
+        if name.lower() in df_columns:
+            return name.lower()
+    return None
+# --- END CORRECTED HELPER ---
+
+# --- NEW HELPER FUNCTION ---
+def _generate_log_template(message):
+    """
+    Applies regexes to a message string to replace variables with wildcards.
+    """
+    template = str(message)
+    for regex in LOG_TEMPLATE_REGEXES:
+        template = regex.sub('*', template)
+    return template
+# --- END NEW HELPER ---
+
 def load_log_file(filepath):
     """
     Loads the log file (JSON or CSV) into a pandas DataFrame.
+    This version now supports both JSON Arrays and JSON Lines files
+    and prevents hangs by pre-flattening 'attributes' and using max_level=1.
     """
     # Status message is printed from main()
     df = None # Initialize df
@@ -122,16 +191,57 @@ def load_log_file(filepath):
 
         if file_ext == '.json':
             print("  Detected JSON file. Reading file into memory...")
+            data = []
             with open(filepath, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+                # --- NEW: Try to load as array, fallback to JSON Lines ---
+                try:
+                    # Try loading as a single JSON array
+                    data = json.load(f)
+                    print("  File loaded as a single JSON array.")
+                except json.JSONDecodeError as e:
+                    # If it fails, rewind and try to read as JSON Lines
+                    print(f"  ...Could not parse as JSON array ({e}). Checking for JSON Lines...")
+                    f.seek(0) # Rewind file
+                    lines = f.readlines()
+                    for i, line in enumerate(lines):
+                        if line.strip():
+                            try:
+                                data.append(json.loads(line))
+                            except json.JSONDecodeError as line_e:
+                                print(f"  ...Skipping malformed JSON line #{i+1}: {line_e}")
+                    if not data:
+                        print("  Error: File is not a valid JSON array or JSON Lines.")
+                        return None
+                    print("  File successfully loaded as JSON Lines.")
             
             print(f"  Loaded {len(data)} JSON objects. Normalizing into DataFrame...")
             if not isinstance(data, list):
-                print("  Error: Expected a JSON array (a list of log objects).")
+                print("  Error: Loaded data is not a list (this shouldn't happen).")
                 return None
             
-            # Normalize the JSON (handles nested objects if any)
-            df = pd.json_normalize(data)
+            # --- NEW: Pre-flatten the 'attributes' field ---
+            print("  ...Pre-flattening 'attributes' field for performance...")
+            processed_data = []
+            count_flattened = 0
+            for log in data:
+                if 'attributes' in log and isinstance(log['attributes'], dict):
+                    # Pop the attributes dict to modify it
+                    attrs = log.pop('attributes')
+                    for key, value in attrs.items():
+                        log[f'attributes.{key}'] = value
+                    count_flattened += 1
+                processed_data.append(log)
+            
+            if count_flattened > 0:
+                print(f"  ...Promoted 'attributes' fields in {count_flattened} logs.")
+            data = processed_data # Overwrite data with the processed version
+            # --- END PRE-FLATTENING ---
+            
+            # --- FIX FOR HANGING ---
+            # Set max_level=1 as requested, since we pre-flattened 'attributes'.
+            print("  ...Flattening all other fields (max_level=1).")
+            df = pd.json_normalize(data, max_level=1) 
+            # --- END FIX ---
 
         elif file_ext == '.csv':
             print("  Detected CSV file. Reading file into DataFrame...")
@@ -168,6 +278,7 @@ def load_log_file(filepath):
         print(f"  Error: File not found at '{filepath}'")
         return None
     except json.JSONDecodeError:
+        # This will catch a file that is not JSON at all
         print("  Error: Could not decode JSON. File may be corrupt or not valid JSON.")
         return None
     except pd.errors.ParserError:
@@ -413,18 +524,32 @@ def calculate_log_hashes_and_size(df, payload_size_percentile):
     exclude_cols = set(HASH_COLUMNS_TO_EXCLUDE)
     cols_to_hash = [col for col in df.columns if col not in exclude_cols]
     
-    if 'message' not in cols_to_hash:
+    hash_failed = False
+    
+    # --- Find message column (could be flat or nested) ---
+    # We need to hash 'message' if it exists, but not 'message' if it's JSON
+    # For hashing, we'll just use the raw 'message' field if it exists.
+    # A proper hash would parse the JSON message, remove IDs, and re-serialize
+    # but that is too slow. We will rely on 'message' column.
+    
+    message_col = find_first_column(df.columns, ['message'])
+    
+    if not message_col:
         print("  ...Skipping hash analysis: 'message' column not found.")
-        return None, None
-        
-    print(f"  ...Hashing based on {len(cols_to_hash)} attributes.")
-    try:
-        # Convert all columns to string before hashing to avoid errors
-        hashes = pd.util.hash_pandas_object(df[cols_to_hash].astype(str), index=False)
-        df['log_hash'] = hashes
-    except Exception as e:
-        print(f"  ...An error occurred during log hashing: {e}")
-        return None, None
+        hash_failed = True
+    else:
+        # Ensure message is in the hash list if it's not excluded
+        if message_col not in cols_to_hash and message_col not in exclude_cols:
+             cols_to_hash.append(message_col)
+             
+        print(f"  ...Hashing based on {len(cols_to_hash)} attributes (including '{message_col}').")
+        try:
+            # Convert all columns to string before hashing to avoid errors
+            hashes = pd.util.hash_pandas_object(df[cols_to_hash].astype(str), index=False)
+            df['log_hash'] = hashes
+        except Exception as e:
+            print(f"  ...An error occurred during log hashing: {e}")
+            hash_failed = True
 
     # Calculate total size of all string-converted columns
     print("  ...Calculating total payload size for each log.")
@@ -438,7 +563,11 @@ def calculate_log_hashes_and_size(df, payload_size_percentile):
         return None, None
 
     end_time = time.time()
-    print(f"  ...Hash and size calculation complete ({end_time - start_time:.2f}s).")
+    if hash_failed:
+        print(f"  ...Size calculation complete ({end_time - start_time:.2f}s).")
+    else:
+        print(f"  ...Hash and size calculation complete ({end_time - start_time:.2f}s).")
+    
     print(f"  ...Top {100*(1-payload_size_percentile):.1f}% payload size threshold: {size_threshold:.0f} chars.")
     
     return size_threshold, df
@@ -479,13 +608,14 @@ def print_duplicate_log_hash_anomalies(df, total_logs, log_hash_frequency_thresh
 
     # Get the *base* context columns that exist in the DF
     base_context_cols = [col for col in PREFERRED_CONTEXT_ATTRIBUTES if col in df.columns]
+    message_col = find_first_column(df.columns, ['message'])
 
     for i, (hash_val, count) in enumerate(frequent_hashes.head(TOP_ANOMALOUS_MESSAGES).items(), 1):
         
         # Get the very first row that matches this hash
         first_row = df.loc[df['log_hash'] == hash_val].iloc[0]
         
-        message = first_row.get('message', 'N/A')
+        message = first_row.get(message_col, 'N/A')
         level_key = next((k for k in first_row.index if k in ['level', 'log.level', 'severity']), None)
         level = first_row.get(level_key, 'N/A') if level_key else 'N/A'
 
@@ -501,15 +631,16 @@ def print_duplicate_log_hash_anomalies(df, total_logs, log_hash_frequency_thresh
         print("    * **Example Log Context:**")
         
         # --- MODIFICATION: Only print attributes that exist (are not NaN) ---
-        for col_name in ['message'] + base_context_cols:
-            if col_name in first_row.index:
+        context_cols_to_print = [message_col] + base_context_cols
+        for col_name in context_cols_to_print:
+            if col_name and col_name in first_row.index: # Check if col_name is not None
                 value = first_row.get(col_name)
                 # Check if value is NaN or None
                 if pd.isna(value):
                     continue # Skip printing this attribute
                     
                 value_str = str(value)
-                if len(value_str) > 70 and col_name != 'message': 
+                if len(value_str) > 70 and col_name != message_col: 
                     value_str = value_str[:70] + "..."
                 elif len(value_str) > 150: # Longer truncation for message
                     value_str = value_str[:150] + "..."
@@ -570,13 +701,14 @@ def print_large_payload_hash_anomalies(df, total_logs, size_threshold, hash_freq
 
     # Get the *base* context columns that exist in the DF
     base_context_cols = [col for col in PREFERRED_CONTEXT_ATTRIBUTES if col in df.columns]
+    message_col = find_first_column(df.columns, ['message'])
 
     for i, (hash_val, count) in enumerate(frequent_large_hashes.head(TOP_ANOMALOUS_MESSAGES).items(), 1):
         
         # Get the first row for this hash
         first_row = df.loc[df['log_hash'] == hash_val].iloc[0]
         
-        message = first_row.get('message', 'N/A')
+        message = first_row.get(message_col, 'N/A')
         level_key = next((k for k in first_row.index if k in ['level', 'log.level', 'severity']), None)
         level = first_row.get(level_key, 'N/A') if level_key else 'N/A'
 
@@ -598,15 +730,16 @@ def print_large_payload_hash_anomalies(df, total_logs, size_threshold, hash_freq
         print("    * **Example Log Context:**")
         
         # --- MODIFICATION: Only print attributes that exist (are not NaN) ---
-        for col_name in ['message'] + base_context_cols:
-            if col_name in first_row.index:
+        context_cols_to_print = [message_col] + base_context_cols
+        for col_name in context_cols_to_print:
+            if col_name and col_name in first_row.index: # Check if col_name is not None
                 value = first_row.get(col_name)
                 # Check if value is NaN or None
                 if pd.isna(value):
                     continue # Skip printing this attribute
                     
                 value_str = str(value)
-                if len(value_str) > 70 and col_name != 'message': 
+                if len(value_str) > 70 and col_name != message_col: 
                     value_str = value_str[:70] + "..."
                 elif len(value_str) > 150: # Longer truncation for message
                     value_str = value_str[:150] + "..."
@@ -633,8 +766,10 @@ def print_high_frequency_anomalies(df, total_logs, top_n):
     print("  (This finds similar messages, ignoring pod names/IDs)")
     start_time = time.time()
 
+    message_col = find_first_column(df.columns, ['message'])
+
     # All columns are normalized, so just check for 'message'
-    if 'message' not in df.columns:
+    if not message_col:
         print("  Cannot perform frequency analysis: 'message' column not found.")
         print(f"  Available columns are: {list(df.columns)}")
         return
@@ -649,19 +784,23 @@ def print_high_frequency_anomalies(df, total_logs, top_n):
         ]
     ]
     
-    group_by_cols = ['message'] + context_cols_to_use
+    group_by_cols = [message_col] + context_cols_to_use
 
     print(f"  Analyzing anomalies by grouping: {group_by_cols}")
 
     try:
         analysis_df = df[group_by_cols].copy()
         
+        # --- FIX: Exclude rows where the message is null ---
+        analysis_df = analysis_df[analysis_df[message_col].notna()]
+        # --- END FIX ---
+        
         # Convert message to string and strip whitespace
-        analysis_df['message'] = analysis_df['message'].astype(str).str.strip()
+        analysis_df[message_col] = analysis_df[message_col].astype(str).str.strip()
         
         # Fill NaN in context columns so they are grouped as 'N/A'
         for col in group_by_cols:
-            if col != 'message':
+            if col != message_col:
                 analysis_df[col] = analysis_df[col].fillna('N/A')
 
         combination_counts = analysis_df.groupby(group_by_cols).size()
@@ -704,7 +843,7 @@ def print_high_frequency_anomalies(df, total_logs, top_n):
         if isinstance(combination, tuple):
             # Create a dict from the combination for easy lookup
             combo_dict = dict(zip(group_by_cols, combination))
-            message = combo_dict.get('message', "N/A")
+            message = combo_dict.get(message_col, "N/A")
             
             # Find the level, checking for 'level' or other common names
             level_key = next((k for k in combo_dict if k in ['level', 'log.level', 'severity']), None)
@@ -735,7 +874,7 @@ def print_high_frequency_anomalies(df, total_logs, top_n):
              value_str = str(combination)
              if len(value_str) > 150:
                  value_str = value_str[:150] + "..."
-             print(f"        - message: \"{value_str}\"")
+             print(f"        - {message_col}: \"{value_str}\"")
 
         print("-" * 20)
 
@@ -745,12 +884,12 @@ def print_large_attribute_anomalies(df, total_logs, large_attr_char_length, larg
     """
     print("\n" + ("=" * 20))
     print("  Starting large attribute analysis...")
-    # --- FIX: Re-added missing start_time ---
     start_time = time.time()
-    # --- END FIX ---
+    
+    message_col = find_first_column(df.columns, ['message'])
     
     # Don't check 'message' or other known-large fields
-    EXCLUDE_FROM_LARGE_CHECK = ATTRIBUTES_TO_IGNORE + ['message']
+    EXCLUDE_FROM_LARGE_CHECK = ATTRIBUTES_TO_IGNORE + [message_col]
     
     found_anomalies = False
     
@@ -811,13 +950,15 @@ def print_truncated_log_anomalies(df, total_logs):
     print("  Starting truncated log analysis...")
     start_time = time.time()
     
-    if 'message' not in df.columns:
+    message_col = find_first_column(df.columns, ['message'])
+    
+    if not message_col:
         print("  ...Cannot perform truncated log analysis: 'message' column not found.")
         return
 
     try:
         # Find all non-null messages that are strings and end with \n
-        truncated_logs = df[df['message'].astype(str).str.endswith('\n', na=False)]
+        truncated_logs = df[df[message_col].astype(str).str.endswith('\n', na=False)]
         count = len(truncated_logs)
     except Exception as e:
         print(f"  ...An error occurred during truncated log analysis: {e}")
@@ -825,7 +966,7 @@ def print_truncated_log_anomalies(df, total_logs):
 
     if count > 0:
         percentage = (count / total_logs) * 100
-        example = truncated_logs.iloc[0]['message']
+        example = truncated_logs.iloc[0][message_col]
         if len(example) > 200:
             example = "..." + example[-200:] # Show the end of the line
         
@@ -845,51 +986,312 @@ def print_truncated_log_anomalies(df, total_logs):
     end_time = time.time()
     print(f"  ...Truncated log analysis complete ({end_time - start_time:.2f}s).")
 
-def print_all_anomaly_insights(df, total_logs, top_n, 
+def print_all_anomaly_insights(df_with_hashes, size_threshold, total_logs, top_n, 
                                log_hash_frequency_threshold,
-                               payload_size_percentile, # New
-                               payload_size_hash_frequency, # New
+                               payload_size_hash_frequency,
                                large_attr_char_length, 
                                large_attr_percentile, 
                                large_attr_presence_threshold):
     """
     Master function to run all types of anomaly analysis.
+    Assumes df_with_hashes already contains 'log_hash' and 'log_total_size'.
     """
     print_header("Potential Anomaly Insights")
     
-    # --- MODIFICATION: New analysis pipeline ---
-
-    # 1. Calculate Hashes and Sizes (this adds 'log_hash' and 'log_total_size' to df)
-    size_threshold, df_with_hashes = calculate_log_hashes_and_size(df, payload_size_percentile)
+    # --- MODIFICATION: Hashing/Sizing is now done in main() ---
     
-    if size_threshold is None: # This happens if 'message' is missing
-        print("...Skipping all hash-based anomaly detection.")
+    if size_threshold is None or df_with_hashes is None or 'log_hash' not in df_with_hashes.columns:
+        print("...Skipping all hash-based anomaly detection (required columns not found).")
     else:
         # 2. Duplicate Log Hash Analysis (Uses 'log_hash')
-        print_duplicate_log_hash_anomalies(df_with_hashes, total_logs, log_hash_frequency_threshold)
+        # We pass a copy so the drops inside don't affect other analyses
+        print_duplicate_log_hash_anomalies(df_with_hashes.copy(), total_logs, log_hash_frequency_threshold)
     
         # 3. Large Payload Hash Analysis (Uses 'log_hash' and 'log_total_size')
-        print_large_payload_hash_anomalies(df_with_hashes, total_logs, size_threshold, payload_size_hash_frequency)
+        print_large_payload_hash_anomalies(df_with_hashes.copy(), total_logs, size_threshold, payload_size_hash_frequency)
     
-        # Clean up columns
-        if 'log_hash' in df.columns:
-            df.drop(columns=['log_hash'], inplace=True, errors='ignore')
-        if 'log_total_size' in df.columns:
-            df.drop(columns=['log_total_size'], inplace=True, errors='ignore')
-
     # 4. High-Frequency Message Combinations (Message-based)
-    print_high_frequency_anomalies(df, total_logs, top_n)
+    # This function doesn't need the hash columns
+    print_high_frequency_anomalies(df_with_hashes, total_logs, top_n)
     
     # 5. Large Attribute Analysis
-    print_large_attribute_anomalies(df, total_logs, large_attr_char_length, large_attr_percentile, large_attr_presence_threshold)
+    print_large_attribute_anomalies(df_with_hashes, total_logs, large_attr_char_length, large_attr_percentile, large_attr_presence_threshold)
     
     # 6. Truncated Log Analysis
-    print_truncated_log_anomalies(df, total_logs)
+    print_truncated_log_anomalies(df_with_hashes, total_logs)
     # --- END MODIFICATION ---
 
-# --- NEW: Gemini API Call Functions (Now Synchronous) ---
+# --- MODIFIED FUNCTION ---
+def print_metricname_deep_dive(df_with_metrics, total_logs):
+    """
+    Performs a deep-dive analysis on 'metricName' if it exists,
+    breaking down ingest by metric, group, and newrelic.source.
+    
+    This new version reports on BOTH ingest size and log count
+    and can find metrics at the top-level OR inside a JSON 'message' string.
+    """
+    print_header("MetricName Deep Dive Analysis")
+    
+    df_columns = df_with_metrics.columns
+    
+    # --- Define a helper to safely parse JSON from a string ---
+    def _try_parse_json(val, key_to_get):
+        if not isinstance(val, str) or not val.startswith('{'):
+            return None
+        try:
+            data = json.loads(val)
+            # Handle nested 'attributes' key inside message
+            if 'attributes' in data and isinstance(data['attributes'], dict):
+                return data['attributes'].get(key_to_get)
+            return data.get(key_to_get)
+        except json.JSONDecodeError:
+            return None
+    
+    # --- Find all possible columns ---
+    flat_metric_col = find_first_column(df_columns, ['metricname'])
+    message_col = find_first_column(df_columns, ['message'])
+    
+    flat_source_col = find_first_column(df_columns, ['newrelic.source'])
+    logtype_col = find_first_column(df_columns, ['logtype'])
 
-def generate_insights_summary(df, total_logs, sorted_stats):
+    # --- DEBUGGING: Print found columns ---
+    # print("  ...[Debug] Checking for metric/source columns:")
+    # print(f"  ...Found 'metricname': {flat_metric_col}")
+    # print(f"  ...Found 'message': {message_col}")
+    # print(f"  ...Found 'newrelic.source': {flat_source_col}")
+    # print(f"  ...Found 'logtype': {logtype_col}")
+    # --- END DEBUGGING ---
+
+    # --- Create a new DataFrame and COALESCE the columns ---
+    metric_df = df_with_metrics[['log_total_size']].copy()
+    final_metric_col = 'final_metric_name'
+    final_source_col = 'final_source'
+    
+    # --- Coalesce metric columns ---
+    metric_df[final_metric_col] = np.nan
+    # 1. Fill with metrics from flat 'metricname' column (for JFR)
+    if flat_metric_col:
+        metric_df[final_metric_col] = metric_df[final_metric_col].fillna(df_with_metrics[flat_metric_col])
+    # 2. Fill with metrics found inside JSON 'message' string (for AWS/GCP/Azure)
+    if message_col:
+        print("  ...Parsing 'message' field for JSON-embedded metrics...")
+        message_metrics = df_with_metrics[message_col].apply(_try_parse_json, key_to_get='metricName')
+        metric_df[final_metric_col] = metric_df[final_metric_col].fillna(message_metrics)
+
+    # --- Coalesce source columns (in priority order) ---
+    metric_df[final_source_col] = np.nan
+    # 1. Fill with 'newrelic.source' from inside JSON 'message' (for AWS)
+    if message_col:
+        print("  ...Parsing 'message' field for JSON-embedded sources...")
+        message_sources = df_with_metrics[message_col].apply(_try_parse_json, key_to_get='newrelic.source')
+        metric_df[final_source_col] = metric_df[final_source_col].fillna(message_sources)
+    # 2. Fill with flat 'newrelic.source' (for JFR)
+    if flat_source_col:
+        metric_df[final_source_col] = metric_df[final_source_col].fillna(df_with_metrics[flat_source_col])
+    # 3. Fill with 'logtype' (for GCP/Azure)
+    if logtype_col:
+        metric_df[final_source_col] = metric_df[final_source_col].fillna(df_with_metrics[logtype_col])
+    # 4. Fill any remaining with 'N/A'
+    metric_df[final_source_col] = metric_df[final_source_col].fillna('N/A')
+    
+    # --- END COALESCE ---
+
+    # Now, filter the new DataFrame to only rows that have a metric name
+    metric_df = metric_df[metric_df[final_metric_col].notna()]
+    
+    if metric_df.empty:
+        print(f"  ...No metrics found in 'metricname' or inside 'message' fields. Skipping.")
+        return None
+
+    # Clean data
+    metric_df[final_metric_col] = metric_df[final_metric_col].astype(str)
+    metric_df[final_source_col] = metric_df[final_source_col].astype(str)
+    metric_df['metric_group'] = metric_df[final_metric_col].apply(_get_metric_group)
+    
+    total_metric_ingest = metric_df['log_total_size'].sum()
+    total_metric_count = len(metric_df)
+    total_sample_ingest = df_with_metrics['log_total_size'].sum()
+    
+    if total_sample_ingest == 0: total_sample_ingest = 1 # Avoid div by zero
+    if total_metric_ingest == 0: total_metric_ingest = 1
+    if total_metric_count == 0: total_metric_count = 1
+
+    print(f"  ...Found {total_metric_count} logs with metric data (from all sources).")
+    print(f"  ...These logs contribute {total_metric_ingest} chars "
+          f"({(total_metric_ingest / total_sample_ingest * 100):.1f}%) of total sample ingest.")
+
+    # String builder for Gemini summary
+    gemini_summary = [
+        f"Metric logs make up {total_metric_count} of {total_logs} logs ({total_metric_count/total_logs*100:.1f}%) "
+        f"and contribute {(total_metric_ingest / total_sample_ingest * 100):.1f}% of total ingest size."
+    ]
+
+    # --- Run all 3 groupings using agg for both sum and count ---
+    source_stats = metric_df.groupby(final_source_col).agg(
+        total_size=('log_total_size', 'sum'),
+        total_count=('log_total_size', 'size')
+    )
+    
+    metric_stats = metric_df.groupby([final_metric_col, final_source_col]).agg(
+        total_size=('log_total_size', 'sum'),
+        total_count=('log_total_size', 'size')
+    )
+    
+    group_stats = metric_df.groupby(['metric_group', final_source_col]).agg(
+        total_size=('log_total_size', 'sum'),
+        total_count=('log_total_size', 'size')
+    )
+
+    # === SECTION 1: BY INGEST SIZE (COST) ===
+    print("\n" + ("=" * 20))
+    print("  ### Breakdown by Ingest Size (Cost Analysis) ###")
+    print("=" * 20)
+
+    # --- By Source (Size) ---
+    print("\n  **By Source (Sorted by Size):**")
+    gemini_summary.append("\nTop 3 Sources by Size:")
+    for source, row in source_stats.sort_values(by='total_size', ascending=False).head(5).iterrows():
+        pct = (row['total_size'] / total_metric_ingest) * 100
+        print(f"    * **{source}**: {pct:.1f}% ({row['total_size']} chars)")
+        if pct > 5:
+            gemini_summary.append(f"- {source}: {pct:.1f}%")
+            
+    # --- By Metric Name (Size) ---
+    print("\n  **By Metric Name (Sorted by Size, Top 10):**")
+    gemini_summary.append("\nTop 3 Metrics by Size:")
+    for (metric, source), row in metric_stats.sort_values(by='total_size', ascending=False).head(10).iterrows():
+        pct = (row['total_size'] / total_metric_ingest) * 100
+        print(f"    * **{metric}** (Source: {source})")
+        print(f"        - **Ingest**: {pct:.1f}% ({row['total_size']} chars)")
+        if len(gemini_summary) < 10: # Limit summary
+             gemini_summary.append(f"- {metric} ({source}): {pct:.1f}%")
+
+    # --- By Metric Group (Size) ---
+    print("\n  **By Metric Group (Sorted by Size, Top 10):**")
+    gemini_summary.append("\nTop 3 Metric Groups by Size:")
+    for (group, source), row in group_stats.sort_values(by='total_size', ascending=False).head(10).iterrows():
+        pct = (row['total_size'] / total_metric_ingest) * 100
+        print(f"    * **{group}** (Source: {source})")
+        print(f"        - **Ingest**: {pct:.1f}% ({row['total_size']} chars)")
+        if len(gemini_summary) < 15: # Limit summary
+             gemini_summary.append(f"- {group} ({source}): {pct:.1f}%")
+             
+    # === SECTION 2: BY LOG COUNT (FREQUENCY) ===
+    print("\n" + ("=" * 20))
+    print("  ### Breakdown by Log Count (Frequency Analysis) ###")
+    print("=" * 20)
+
+    # --- By Source (Count) ---
+    print("\n  **By Source (Sorted by Count):**")
+    for source, row in source_stats.sort_values(by='total_count', ascending=False).head(5).iterrows():
+        pct = (row['total_count'] / total_metric_count) * 100
+        print(f"    * **{source}**: {pct:.1f}% ({row['total_count']} logs)")
+            
+    # --- By Metric Name (Count) ---
+    print("\n  **By Metric Name (Sorted by Count, Top 10):**")
+    for (metric, source), row in metric_stats.sort_values(by='total_count', ascending=False).head(10).iterrows():
+        pct = (row['total_count'] / total_metric_count) * 100
+        print(f"    * **{metric}** (Source: {source})")
+        print(f"        - **Count**: {pct:.1f}% ({row['total_count']} logs)")
+
+    # --- By Metric Group (Count) ---
+    print("\n  **By Metric Group (Sorted by Count, Top 10):**")
+    for (group, source), row in group_stats.sort_values(by='total_count', ascending=False).head(10).iterrows():
+        pct = (row['total_count'] / total_metric_count) * 100
+        print(f"    * **{group}** (Source: {source})")
+        print(f"        - **Count**: {pct:.1f}% ({row['total_count']} logs)")
+
+    print(f"\n  ...MetricName deep dive complete.")
+    return "\n".join(gemini_summary)
+# --- END MODIFIED FUNCTION ---
+
+# --- NEW: Log Template Analysis Function ---
+def print_message_template_analysis(df, total_logs, total_sample_size):
+    """
+    Analyzes log messages by first converting them to templates to find
+    high-frequency patterns.
+    """
+    # --- Text Change: Template -> Pattern ---
+    print_header("Message Pattern Analysis (Log Patterning)")
+    
+    message_col = find_first_column(df.columns, ['message'])
+    if not message_col:
+        print("  ...Skipping pattern analysis: 'message' column not found.")
+        return None
+        
+    print("  ...Generating log patterns for all unique messages (this may take a moment)...")
+    start_time = time.time()
+    
+    # 1. Get all unique messages
+    unique_messages = df[message_col].astype(str).unique()
+    
+    # 2. Create a mapping from raw message to its template
+    # This is much faster than running regex on every row
+    template_map = {msg: _generate_log_template(msg) for msg in unique_messages}
+    
+    # 3. Map the templates back to the DataFrame
+    df['log_template'] = df[message_col].astype(str).map(template_map)
+    
+    end_time = time.time()
+    print(f"  ...Patterning complete for {len(unique_messages)} unique messages ({end_time - start_time:.2f}s).")
+    
+    # 4. Group by the new 'log_template' and get aggregates
+    print("  ...Aggregating stats by pattern...")
+    agg_stats = df.groupby('log_template').agg(
+        total_count=('log_total_size', 'size'),
+        total_size=('log_total_size', 'sum'),
+        unique_message_count=(message_col, 'nunique')
+    )
+    
+    # --- FIX: Exclude 'nan', 'None', 'null' templates from analysis ---
+    unwanted_templates = ['nan', 'None', 'NULL', 'null']
+    agg_stats = agg_stats.drop(unwanted_templates, errors='ignore')
+    # --- END FIX ---
+    
+    if total_sample_size == 0: total_sample_size = 1 # Avoid division by zero
+    if agg_stats.empty:
+        print("  ...No valid log patterns found to report on.")
+        return None
+
+    # === SECTION 1: BY INGEST SIZE (COST) ===
+    print("\n" + ("=" * 20))
+    print("  ### Top 10 Patterns by Ingest Size (Cost) ###")
+    print("=" * 20)
+
+    gemini_summary = []
+    
+    for template, row in agg_stats.sort_values(by='total_size', ascending=False).head(10).iterrows():
+        count_pct = (row['total_count'] / total_logs) * 100
+        size_pct = (row['total_size'] / total_sample_size) * 100
+        
+        print(f"\n**Pattern (Size Rank):** `{template}`")
+        print(f"    * **Payload Size:** {size_pct:.2f}% of total sample ({row['total_size']} chars)")
+        print(f"    * **Log Count:** {count_pct:.2f}% of total sample ({row['total_count']} logs)")
+        print(f"    * **Variations:** {row['unique_message_count']} unique messages match this pattern.")
+
+        if len(gemini_summary) < 3:
+             gemini_summary.append(f"- (Size: {size_pct:.1f}%) `{template}`")
+    
+    # === SECTION 2: BY LOG COUNT (FREQUENCY) ===
+    print("\n" + ("=" * 20))
+    print("  ### Top 10 Patterns by Log Count (Frequency) ###")
+    print("=" * 20)
+
+    for template, row in agg_stats.sort_values(by='total_count', ascending=False).head(10).iterrows():
+        count_pct = (row['total_count'] / total_logs) * 100
+        size_pct = (row['total_size'] / total_sample_size) * 100
+        
+        print(f"\n**Pattern (Count Rank):** `{template}`")
+        print(f"    * **Log Count:** {count_pct:.2f}% of total sample ({row['total_count']} logs)")
+        print(f"    * **Payload Size:** {size_pct:.2f}% of total sample ({row['total_size']} chars)")
+        print(f"    * **Variations:** {row['unique_message_count']} unique messages match this pattern.")
+        
+    print(f"\n  ...Message pattern analysis complete.")
+    return "\n".join(gemini_summary)
+# --- END NEW FUNCTION ---
+
+
+def generate_insights_summary(df, total_logs, sorted_stats, metric_summary=None, template_summary=None):
     """
     Generates a concise text summary of the statistical analysis
     to be used as context for the Gemini API call.
@@ -914,18 +1316,19 @@ def generate_insights_summary(df, total_logs, sorted_stats):
                            f"Contribution: {item['contribution_pct']:.1f}%)")
     
     summary.append("\n--- Top 5 Most Frequent Log Messages ---")
-    if 'message' in df.columns:
-        top_messages = df['message'].astype(str).str.strip().value_counts().head(5)
+    message_col = find_first_column(df.columns, ['message'])
+    if message_col:
+        top_messages = df[message_col].astype(str).str.strip().value_counts().head(5)
         for msg, count in top_messages.items():
             msg_short = msg[:100] + "..." if len(msg) > 100 else msg
             summary.append(f"- (Count: {count}) \"{msg_short}\"")
     
     summary.append("\n--- Key Attribute Examples (for infrastructure detection) ---")
     key_attrs = ['filepath', 'filePath', 'host', 'hostname', 'cluster_name',
-                 'container_name', 'platform', 'entity.name', 'logger']
+                 'container_name', 'platform', 'entity.name', 'logger', 'logtype']
     for attr in key_attrs:
         # Check for normalized AND deduplicated names
-        present_cols = [c for c in df.columns if c.startswith(attr)]
+        present_cols = [c for c in df.columns if c.startswith(attr.lower())]
         for col in present_cols:
             examples = df[col].dropna().unique()[:3]
             if len(examples) > 0:
@@ -934,11 +1337,22 @@ def generate_insights_summary(df, total_logs, sorted_stats):
     summary.append("\n--- Security/Proxy Attribute Examples ---")
     proxy_attrs = ['xffheaderoriginalvalues', 'clientip', 'errorcontent']
     for attr in proxy_attrs:
-         present_cols = [c for c in df.columns if c.startswith(attr)]
+         present_cols = [c for c in df.columns if c.startswith(attr.lower())]
          for col in present_cols:
             examples = df[col].dropna().unique()[:2]
             if len(examples) > 0:
                  summary.append(f"- Examples for '{col}': {', '.join([str(e) for e in examples])}")
+
+    # --- Add Metric Summary if it exists ---
+    if metric_summary:
+        summary.append("\n--- MetricName Deep Dive Summary ---")
+        summary.append(metric_summary)
+        
+    # --- Add Template Summary if it exists ---
+    if template_summary:
+        # --- Text Change: Template -> Pattern ---
+        summary.append("\n--- Top 3 Log Patterns by Size ---")
+        summary.append(template_summary)
 
     return "\n".join(summary)
 
@@ -953,10 +1367,13 @@ def call_gemini_for_insights(summary_text, api_key):
     print("  (This may take a few seconds)...")
     
     # We must use the 'gemini-2.5-flash-preview-09-2025' model
-    # model = "gemini-2.5-flash-preview-09-2025"
-    model = "gemini-2.5-pro"
+    model = "gemini-2.5-flash-preview-09-2025"
+    # model = "gemini-2.5-pro"
+    
+    # --- THIS IS THE CORRECTED LINE ---
     # The URL for the generateContent endpoint (using Python f-string)
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    # --- END CORRECTION ---
     
     system_prompt = (
         "You are an expert-level Site Reliability Engineer (SRE) and FinOps (Cloud Cost) analyst. "
@@ -1029,7 +1446,7 @@ def main():
         help='The path to the JSON or CSV log file to analyze.'
     )
     
-    # --- Tunable Arguments ---
+    # --- Tunable Arguments (All existing args remain) ---
     parser.add_argument(
         '--PRESENCE_THRESHOLD_PCT',
         type=float,
@@ -1088,7 +1505,7 @@ def main():
 
     args = parser.parse_args()
     
-    print("\n--- Step 1/4: Loading Log File ---")
+    print("\n--- Step 1/7: Loading Log File ---")
     start_load = time.time()
     df = load_log_file(args.filepath)
     if df is None or df.empty:
@@ -1098,30 +1515,53 @@ def main():
     print(f"--- File loaded in {end_load - start_load:.2f}s ---")
     
 
-    print("\n--- Step 2/4: Analyzing Attributes ---")
+    print("\n--- Step 2/7: Analyzing Attributes ---")
     total_logs, sorted_stats = analyze_attributes(df)
     
-    print("\n--- Step 3/4: Generating Summary Reports ---")
+    print("\n--- Step 3/7: Generating Summary Reports ---")
     start_report = time.time() 
-    # Pass the new argument to the function
     best_attributes = print_best_attributes(total_logs, sorted_stats, args.PRESENCE_THRESHOLD_PCT)
     print_combination_analysis(best_attributes)
     end_report = time.time()
+    # --- THIS IS THE CORRECTED LINE ---
     print(f"--- Reports generated in {end_report - start_report:.2f}s ---")
+    # --- END CORRECTION ---
     
-    print("\n--- Step 4/4: Analyzing Message Anomalies ---")
-    # We create a copy of the dataframe for anomaly analysis, as hashing adds columns
-    df_for_anomalies = df.copy()
+    # --- Step 4: Calculate Hashes and Sizes ---
+    print("\n--- Step 4/7: Calculating Hashes and Payload Sizes ---")
+    size_threshold, df_with_metrics = calculate_log_hashes_and_size(df, args.PAYLOAD_SIZE_PERCENTILE)
     
-    print_all_anomaly_insights(df_for_anomalies, total_logs, TOP_ANOMALOUS_MESSAGES,
+    if df_with_metrics is None:
+        print("...Hashing/size calculation failed, falling back to original DataFrame for remaining analysis.")
+        df_with_metrics = df.copy() # Use a copy to avoid side-effects
+        if 'log_total_size' not in df_with_metrics.columns:
+             print("...Manually calculating log_total_size as fallback.")
+             df_with_metrics['log_total_size'] = df.astype(str).apply(lambda x: x.str.len()).sum(axis=1)
+    
+    # Calculate total sample size *after* size calculation is done
+    total_sample_size = df_with_metrics['log_total_size'].sum()
+
+
+    # --- Step 5: Anomaly & Metric Analysis ---
+    print("\n--- Step 5/7: Analyzing Anomalies & Metrics ---")
+    
+    # Run the standard anomaly insights
+    print_all_anomaly_insights(df_with_metrics, size_threshold, total_logs, TOP_ANOMALOUS_MESSAGES,
                                args.LOG_HASH_FREQUENCY_THRESHOLD,
-                               args.PAYLOAD_SIZE_PERCENTILE,
                                args.PAYLOAD_SIZE_HASH_FREQUENCY,
                                args.LARGE_ATTR_CHAR_LENGTH,
                                args.LARGE_ATTR_PERCENTILE,
                                args.LARGE_ATTR_PRESENCE_THRESHOLD)
 
-    # --- NEW: Step 5 (Conditional) ---
+    # Run the MetricName Deep Dive
+    metric_summary = print_metricname_deep_dive(df_with_metrics, total_logs)
+    
+    # --- NEW: Step 6: Log Template Analysis ---
+    print("\n--- Step 6/7: Analyzing Message Patterns ---")
+    template_summary = print_message_template_analysis(df_with_metrics, total_logs, total_sample_size)
+    
+
+    # --- NEW: Step 7 (Conditional) ---
     if args.analyze_with_gemini:
         # --- Check for API Key ---
         if not args.GEMINI_API_KEY:
@@ -1132,9 +1572,10 @@ def main():
             print("You can generate a key at https://aistudio.google.com/app/apikey")
             print(("!" * 60) + "\n")
         else:
-            print("\n--- Step 5/5: Generating Advanced Analysis with Gemini ---")
-            # 1. Generate the summary
-            summary_text = generate_insights_summary(df, total_logs, sorted_stats)
+            print("\n--- Step 7/7: Generating Advanced Analysis with Gemini ---")
+            # 1. Generate the summary, now including metric and template summaries
+            summary_text = generate_insights_summary(df, total_logs, sorted_stats, 
+                                                     metric_summary, template_summary)
             
             # 2. Call the API
             gemini_response = call_gemini_for_insights(summary_text, args.GEMINI_API_KEY)
@@ -1150,6 +1591,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Now just a standard function call
     main()
-
