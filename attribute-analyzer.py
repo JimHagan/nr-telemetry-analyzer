@@ -791,6 +791,10 @@ def print_high_frequency_anomalies(df, total_logs, top_n):
     try:
         analysis_df = df[group_by_cols].copy()
         
+        # --- FIX: Exclude rows where the message is null ---
+        analysis_df = analysis_df[analysis_df[message_col].notna()]
+        # --- END FIX ---
+        
         # Convert message to string and strip whitespace
         analysis_df[message_col] = analysis_df[message_col].astype(str).str.strip()
         
@@ -1239,7 +1243,15 @@ def print_message_template_analysis(df, total_logs, total_sample_size):
         unique_message_count=(message_col, 'nunique')
     )
     
+    # --- FIX: Exclude 'nan', 'None', 'null' templates from analysis ---
+    unwanted_templates = ['nan', 'None', 'NULL', 'null']
+    agg_stats = agg_stats.drop(unwanted_templates, errors='ignore')
+    # --- END FIX ---
+    
     if total_sample_size == 0: total_sample_size = 1 # Avoid division by zero
+    if agg_stats.empty:
+        print("  ...No valid log patterns found to report on.")
+        return None
 
     # === SECTION 1: BY INGEST SIZE (COST) ===
     print("\n" + ("=" * 20))
