@@ -1,6 +1,6 @@
-# Log Ingest Attribute Analyzer
+# Telemetry Ingest & Attribute Analyzer
 
-This Python script, `attribute-analyzer.py`, loads and analyzes a JSON or CSV log sample file to provide deep insights into log ingest patterns. It is designed to help you understand *what* you are logging, *where* it's coming from, and *how* to optimize your ingest for cost and performance.
+This Python script, `nr-telemetry-analyzer.py`, loads and analyzes a JSON or CSV log sample file to provide deep insights into log ingest patterns. It is designed to help you understand *what* you are logging, *where* it's coming from, and *how* to optimize your ingest for cost and performance.
 
 The script reports on:
 1.  **Attribute Popularity & Size:** Which attributes are most common and how much data they contribute.
@@ -28,7 +28,7 @@ It is highly recommended to run this script within a Python virtual environment 
 
 ### 1. Create a Virtual Environment
 
-From your terminal, navigate to the directory where you saved `attribute-analyzer.py` and create a virtual environment:
+From your terminal, navigate to the directory where you saved `nr-telemetry-analyzer.py` and create a virtual environment:
 
 ```sh
 # For macOS and Linux
@@ -70,7 +70,7 @@ Run the script from your terminal by passing the path to your JSON or CSV log sa
 ### Basic Usage
 
 ```sh
-python attribute-analyzer.py "path/to/your-log-sample.csv"
+python nr-telemetry-analyzer.py "path/to/your-log-sample.csv"
 ```
 
 ### Advanced Usage with Overrides
@@ -79,10 +79,10 @@ You can override the default analysis thresholds using command-line arguments.
 
 ```sh
 # Run with a stricter presence threshold for attribute analysis
-python attribute-analyzer.py "sample.json" --PRESENCE_THRESHOLD_PCT 50
+python nr-telemetry-analyzer.py "sample.json" --PRESENCE_THRESHOLD_PCT 50
 
 # Run with more aggressive "large payload" detection
-python attribute-analyzer.py "sample.csv" --PAYLOAD_SIZE_PERCENTILE 0.95 --LARGE_ATTR_CHAR_LENGTH 250
+python nr-telemetry-analyzer.py "sample.csv" --PAYLOAD_SIZE_PERCENTILE 0.95 --LARGE_ATTR_CHAR_LENGTH 250
 ```
 
 ### Gemini Advanced Analysis
@@ -91,7 +91,7 @@ To get an AI-powered summary, use the `--analyze_with_gemini` flag and provide y
 
 ```sh
 # Get your key from [https://aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
-python attribute-analyzer.py "sample.csv" --analyze_with_gemini --GEMINI_API_KEY "YOUR_API_KEY_HERE"
+python nr-telemetry-analyzer.py "sample.csv" --analyze_with_gemini --GEMINI_API_KEY "YOUR_API_KEY_HERE"
 ```
 
 ### All Command-Line Arguments
