@@ -5,22 +5,12 @@ Description:
 This script loads a JSON or CSV log sample file, analyzes its contents,
 and provides insights into log attributes and potential high-volume anomalies.
 
-NEW CAPABILITY:
---analyze_with_gemini
-This flag will run all local analyses and then send a summary of the
-findings to the Gemini API for a natural language summary and
-advanced insight generation.
-
-** REQUIRES --GEMINI_API_KEY to be set. **
-
 Required Dependencies:
 -   pandas: This is the only external library required.
     You can install it using pip:
     pip install pandas
 -   numpy: A dependency of pandas.
--   requests: Used to call the Gemini API.
-    You can install it using pip:
-    pip install requests
+-   requests
 
 Usage:
 Save this file as 'attribute-analyzer.py' and run it from your terminal,
@@ -32,8 +22,6 @@ Example:
 Advanced Usage:
     python attribute-analyzer.py path/to/sample.json --PRESENCE_THRESHOLD_PCT 50
 
-Gemini Analysis:
-    python attribute-analyzer.py path/to/sample.csv --analyze_with_gemini --GEMINI_API_KEY "YOUR_API_KEY"
 
 """
 
@@ -1120,11 +1108,7 @@ def print_metricname_deep_dive(df_with_metrics, total_logs):
     print(f"  ...These logs contribute {total_metric_ingest} chars "
           f"({(total_metric_ingest / total_sample_ingest * 100):.1f}%) of total sample ingest.")
 
-    # String builder for Gemini summary
-    gemini_summary = [
-        f"Metric logs make up {total_metric_count} of {total_logs} logs ({total_metric_count/total_logs*100:.1f}%) "
-        f"and contribute {(total_metric_ingest / total_sample_ingest * 100):.1f}% of total ingest size."
-    ]
+
 
     # --- Run all 3 groupings using agg for both sum and count ---
     source_stats = metric_df.groupby(final_source_col).agg(
@@ -1149,32 +1133,23 @@ def print_metricname_deep_dive(df_with_metrics, total_logs):
 
     # --- By Source (Size) ---
     print("\n  **By Source (Sorted by Size):**")
-    gemini_summary.append("\nTop 3 Sources by Size:")
     for source, row in source_stats.sort_values(by='total_size', ascending=False).head(5).iterrows():
         pct = (row['total_size'] / total_metric_ingest) * 100
         print(f"    * **{source}**: {pct:.1f}% ({row['total_size']} chars)")
-        if pct > 5:
-            gemini_summary.append(f"- {source}: {pct:.1f}%")
-            
+                    
     # --- By Metric Name (Size) ---
     print("\n  **By Metric Name (Sorted by Size, Top 10):**")
-    gemini_summary.append("\nTop 3 Metrics by Size:")
     for (metric, source), row in metric_stats.sort_values(by='total_size', ascending=False).head(10).iterrows():
         pct = (row['total_size'] / total_metric_ingest) * 100
         print(f"    * **{metric}** (Source: {source})")
         print(f"        - **Ingest**: {pct:.1f}% ({row['total_size']} chars)")
-        if len(gemini_summary) < 10: # Limit summary
-             gemini_summary.append(f"- {metric} ({source}): {pct:.1f}%")
 
     # --- By Metric Group (Size) ---
     print("\n  **By Metric Group (Sorted by Size, Top 10):**")
-    gemini_summary.append("\nTop 3 Metric Groups by Size:")
     for (group, source), row in group_stats.sort_values(by='total_size', ascending=False).head(10).iterrows():
         pct = (row['total_size'] / total_metric_ingest) * 100
         print(f"    * **{group}** (Source: {source})")
         print(f"        - **Ingest**: {pct:.1f}% ({row['total_size']} chars)")
-        if len(gemini_summary) < 15: # Limit summary
-             gemini_summary.append(f"- {group} ({source}): {pct:.1f}%")
              
     # === SECTION 2: BY LOG COUNT (FREQUENCY) ===
     print("\n" + ("=" * 20))
@@ -1202,8 +1177,7 @@ def print_metricname_deep_dive(df_with_metrics, total_logs):
         print(f"        - **Count**: {pct:.1f}% ({row['total_count']} logs)")
 
     print(f"\n  ...MetricName deep dive complete.")
-    return "\n".join(gemini_summary)
-# --- END MODIFIED FUNCTION ---
+ # --- END MODIFIED FUNCTION ---
 
 # --- NEW: Log Template Analysis Function ---
 def print_message_template_analysis(df, total_logs, total_sample_size):
@@ -1257,9 +1231,7 @@ def print_message_template_analysis(df, total_logs, total_sample_size):
     print("\n" + ("=" * 20))
     print("  ### Top 10 Patterns by Ingest Size (Cost) ###")
     print("=" * 20)
-
-    gemini_summary = []
-    
+  
     for template, row in agg_stats.sort_values(by='total_size', ascending=False).head(10).iterrows():
         count_pct = (row['total_count'] / total_logs) * 100
         size_pct = (row['total_size'] / total_sample_size) * 100
@@ -1269,9 +1241,7 @@ def print_message_template_analysis(df, total_logs, total_sample_size):
         print(f"    * **Log Count:** {count_pct:.2f}% of total sample ({row['total_count']} logs)")
         print(f"    * **Variations:** {row['unique_message_count']} unique messages match this pattern.")
 
-        if len(gemini_summary) < 3:
-             gemini_summary.append(f"- (Size: {size_pct:.1f}%) `{template}`")
-    
+   
     # === SECTION 2: BY LOG COUNT (FREQUENCY) ===
     print("\n" + ("=" * 20))
     print("  ### Top 10 Patterns by Log Count (Frequency) ###")
@@ -1287,14 +1257,13 @@ def print_message_template_analysis(df, total_logs, total_sample_size):
         print(f"    * **Variations:** {row['unique_message_count']} unique messages match this pattern.")
         
     print(f"\n  ...Message pattern analysis complete.")
-    return "\n".join(gemini_summary)
-# --- END NEW FUNCTION ---
+ # --- END NEW FUNCTION ---
 
 
 def generate_insights_summary(df, total_logs, sorted_stats, metric_summary=None, template_summary=None):
     """
     Generates a concise text summary of the statistical analysis
-    to be used as context for the Gemini API call.
+    to be used as context for the AI API call.
     """
     print("\n" + ("=" * 20))
     print("  Generating statistical summary as input...")
@@ -1356,77 +1325,6 @@ def generate_insights_summary(df, total_logs, sorted_stats, metric_summary=None,
 
     return "\n".join(summary)
 
-
-def call_gemini_for_insights(summary_text, api_key):
-    """
-    Calls the Gemini API with the statistical summary to get
-    a natural language analysis. (Now synchronous using 'requests')
-    """
-    print("\n" + ("=" * 20))
-    print("  Running advanced analysis...")
-    print("  (This may take a few seconds)...")
-    
-    # We must use the 'gemini-2.5-flash-preview-09-2025' model
-    model = "gemini-2.5-flash-preview-09-2025"
-    # model = "gemini-2.5-pro"
-    
-    # --- THIS IS THE CORRECTED LINE ---
-    # The URL for the generateContent endpoint (using Python f-string)
-    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    # --- END CORRECTION ---
-    
-    system_prompt = (
-        "You are an expert-level Site Reliability Engineer (SRE) and FinOps (Cloud Cost) analyst. "
-        "Your job is to analyze a statistical summary from a log sample and provide a natural language summary. "
-        "First, describe the *infrastructure* and *application stack* you can infer from the attributes. "
-        "Second, identify specific, actionable anomalies related to *cost*, *performance*, or *security*. "
-        "Cite the log evidence (e.g., messages, attributes) from the summary in your analysis. "
-        "Format your response in clean markdown."
-    )
-    
-    user_prompt = (
-        "Here is the statistical summary from a log file analysis. Please provide your "
-        "SRE/FinOps analysis as described in your system instructions.\n\n"
-        "--- ANALYSIS SUMMARY --- \n"
-        f"{summary_text}"
-    )
-
-    payload = {
-        "contents": [{ "parts": [{ "text": user_prompt }] }],
-        "systemInstruction": {
-            "parts": [{ "text": system_prompt }]
-        }
-    }
-    
-    headers = { "Content-Type": "application/json" }
-
-    try:
-        response = requests.post(api_url, json=payload, headers=headers)
-
-        if not response.ok:
-            print(f"  ...Gemini API Error: {response.status_code} {response.reason}", response.text)
-            return f"Error: Gemini API call failed with status {response.status_code}."
-
-        result = response.json()
-        candidate = result.get('candidates', [{}])[0]
-        text = candidate.get('content', {}).get('parts', [{}])[0].get('text')
-
-        if text:
-            print("  ...Gemini analysis complete.")
-            return text
-        else:
-            print("  ...Gemini API Error: No valid text response found in candidate.", result)
-            return "Error: Received an invalid or empty response from the API."
-            
-    except requests.exceptions.RequestException as e:
-        print(f"  ...An error occurred during the API request: {e}")
-        return f"Error: Failed to call API. {e}"
-    except Exception as e:
-        print(f"  ...An unexpected error occurred during Gemini call: {e}")
-        return f"Error: {e}"
-
-
-# --- Main Execution ---
 
 def main():
     """
@@ -1490,19 +1388,6 @@ def main():
         help='For large payloads, report hashes that exceed this frequency (e.g., 0.01 = 1%%). Default: 0.01'
     )
     
-    # --- GEMINI FLAGS ---
-    parser.add_argument(
-        '--analyze_with_gemini',
-        action='store_true',
-        help='Send a statistical summary to the Gemini API for advanced analysis.'
-    )
-    parser.add_argument(
-        '--GEMINI_API_KEY',
-        type=str,
-        default=None,
-        help='Your Gemini API key. Required if --analyze_with_gemini is used.'
-    )
-
     args = parser.parse_args()
     
     print("\n--- Step 1/7: Loading Log File ---")
@@ -1560,31 +1445,6 @@ def main():
     print("\n--- Step 6/7: Analyzing Message Patterns ---")
     template_summary = print_message_template_analysis(df_with_metrics, total_logs, total_sample_size)
     
-
-    # --- NEW: Step 7 (Conditional) ---
-    if args.analyze_with_gemini:
-        # --- Check for API Key ---
-        if not args.GEMINI_API_KEY:
-            print("\n" + ("!" * 60))
-            print("### ERROR: Missing Gemini API Key ###")
-            print("To use --analyze_with_gemini, you must also provide your API key:")
-            print("  --GEMINI_API_KEY \"YOUR_API_KEY_HERE\"")
-            print("You can generate a key at https://aistudio.google.com/app/apikey")
-            print(("!" * 60) + "\n")
-        else:
-            print("\n--- Step 7/7: Generating Advanced Analysis with Gemini ---")
-            # 1. Generate the summary, now including metric and template summaries
-            summary_text = generate_insights_summary(df, total_logs, sorted_stats, 
-                                                     metric_summary, template_summary)
-            
-            # 2. Call the API
-            gemini_response = call_gemini_for_insights(summary_text, args.GEMINI_API_KEY)
-            
-            # 3. Print the response
-            print_header("Advanced Analysis")
-            print(gemini_response)
-
-
     print("\n" + ("-" * 60))
     print("Analysis Complete.")
     print(("-" * 60) + "\n")
